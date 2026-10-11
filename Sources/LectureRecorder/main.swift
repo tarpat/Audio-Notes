@@ -2,6 +2,8 @@ import AppKit
 import AVFoundation
 import SwiftUI
 import UniformTypeIdentifiers
+import ScreenCaptureKit
+import CoreMedia
 
 @main
 struct LectureRecorderApp: App {
@@ -102,6 +104,7 @@ final class LectureLibrary: ObservableObject {
     @Published var workProgress: Double = 0
     @Published var error: String?
     @Published var title = LectureLibrary.defaultTitle()
+    @Published var recordingMode = RecordingMode.lecture
     private var suggestedTitle = LectureLibrary.defaultTitle()
     @Published var model = UserDefaults.standard.string(forKey: "ollamaModel") ?? "qwen3.5:4b"
     @Published var whisperModelPath = UserDefaults.standard.string(forKey: "whisperModelPath") ?? ""
@@ -111,6 +114,8 @@ final class LectureLibrary: ObservableObject {
     @Published var notesText = ""
 
     private var recorder: AVAudioRecorder?
+    private var discordCapture: DiscordAudioCapture?
+    private var currentRecordingFolder: URL?
 
     init() { refresh() }
 
@@ -183,6 +188,10 @@ final class LectureLibrary: ObservableObject {
     }
 
     func startRecording() {
+        if recordingMode == .discord {
+            Task { await startDiscordRecording() }
+            return
+        }
         do {
             let root = URL(fileURLWithPath: recordingsPath, isDirectory: true)
             let now = Date.now
@@ -211,6 +220,7 @@ final class LectureLibrary: ObservableObject {
             newRecorder.isMeteringEnabled = false
             guard newRecorder.record() else { throw AppError.recordingStart }
             recorder = newRecorder
+            currentRecordingFolder = folder
             isRecording = true
             isPaused = false
             suggestedTitle = Self.defaultTitle()
@@ -220,6 +230,35 @@ final class LectureLibrary: ObservableObject {
         } catch { self.error = error.localizedDescription }
     }
 
+    private func startDiscordRecording() async {
+        do {
+            let root = URL(fileURLWithPath: recordingsPath, isDirectory: true)
+            let timestamp = Self.defaultTitle()
+            let enteredTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+            let cleanTitle = enteredTitle.isEmpty || enteredTitle == suggestedTitle ? timestamp : enteredTitle
+            let courseRoot = root.appendingPathComponent(selectedCourse, isDirectory: true)
+            try FileManager.default.createDirectory(at: courseRoot, withIntermediateDirectories: true)
+            var folder = courseRoot.appendingPathComponent(cleanTitle, isDirectory: true)
+            var suffix = 2
+            while FileManager.default.fileExists(atPath: folder.path) {
+                folder = courseRoot.appendingPathComponent("\(cleanTitle) (\(suffix))", isDirectory: true); suffix += 1
+            }
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            let capture = try await DiscordAudioCapture.start(outputURL: folder.appendingPathComponent("system.m4a"))
+            let settings: [String: Any] = [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: 22_050,
+                                           AVNumberOfChannelsKey: 1, AVEncoderBitRateKey: 64_000,
+                                           AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue]
+            let micURL = folder.appendingPathComponent("mic.m4a")
+            let mic = try AVAudioRecorder(url: micURL, settings: settings)
+            guard mic.record() else { await capture.stop(); throw AppError.recordingStart }
+            recorder = mic; discordCapture = capture; currentRecordingFolder = folder
+            isRecording = true; isPaused = false; suggestedTitle = Self.defaultTitle(); title = suggestedTitle
+            selectedID = folder; refresh()
+        } catch {
+            self.error = "Discord audio capture could not start. Allow Screen Recording and Microphone access in System Settings, then retry. (\(error.localizedDescription))"
+        }
+    }
+
     func togglePause() {
         if isPaused { recorder?.record() } else { recorder?.pause() }
         isPaused.toggle()
@@ -227,8 +266,30 @@ final class LectureLibrary: ObservableObject {
 
     func stopRecording() {
         recorder?.stop(); recorder = nil
-        isRecording = false; isPaused = false
-        refresh()
+        guard let capture = discordCapture, let folder = currentRecordingFolder else {
+            isRecording = false; isPaused = false; refresh(); return
+        }
+        discordCapture = nil
+        Task {
+            do {
+                await capture.stop()
+                let ffmpeg = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"].first(where: { FileManager.default.isExecutableFile(atPath: $0) })
+                guard let ffmpeg else { throw AppError.ffmpegMissing }
+                try Self.mixDiscordAudio(ffmpeg: ffmpeg, system: folder.appendingPathComponent("system.m4a"),
+                                         mic: folder.appendingPathComponent("mic.m4a"), output: folder.appendingPathComponent("recording.m4a"))
+                try? FileManager.default.removeItem(at: folder.appendingPathComponent("system.m4a"))
+                try? FileManager.default.removeItem(at: folder.appendingPathComponent("mic.m4a"))
+            } catch { self.error = "Could not combine Discord audio: \(error.localizedDescription)" }
+            isRecording = false; isPaused = false; currentRecordingFolder = nil; refresh()
+        }
+    }
+
+    nonisolated private static func mixDiscordAudio(ffmpeg: String, system: URL, mic: URL, output: URL) throws {
+        let process = Process(); process.executableURL = URL(fileURLWithPath: ffmpeg)
+        process.arguments = ["-nostdin", "-y", "-i", system.path, "-i", mic.path, "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=longest:normalize=0", "-c:a", "aac", "-b:a", "96k", output.path]
+        process.standardError = FileHandle.nullDevice; process.standardOutput = FileHandle.nullDevice
+        try process.run(); process.waitUntilExit()
+        guard process.terminationStatus == 0 else { throw AppError.audioConversionFailed }
     }
 
     func deleteSelectedLecture() {
@@ -371,8 +432,62 @@ final class LectureLibrary: ObservableObject {
 
 struct OllamaResponse: Decodable { let message: Message; struct Message: Decodable { let content: String } }
 
+enum RecordingMode: String, CaseIterable, Identifiable {
+    case lecture = "Lecture"
+    case discord = "Discord"
+    var id: String { rawValue }
+}
+
+final class DiscordAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
+    private let stream: SCStream
+    private let writer: AVAssetWriter
+    private let input: AVAssetWriterInput
+    private let queue = DispatchQueue(label: "local.lecturerecorder.discord-audio")
+    private var started = false
+
+    private init(stream: SCStream, writer: AVAssetWriter, input: AVAssetWriterInput) {
+        self.stream = stream; self.writer = writer; self.input = input
+    }
+
+    static func start(outputURL: URL) async throws -> DiscordAudioCapture {
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        guard let display = content.displays.first else { throw AppError.noDisplay }
+        let filter = SCContentFilter(display: display, excludingWindows: [])
+        let configuration = SCStreamConfiguration()
+        configuration.width = 2; configuration.height = 2
+        configuration.capturesAudio = true; configuration.sampleRate = 48_000; configuration.channelCount = 2
+        configuration.excludesCurrentProcessAudio = true
+        let writer = try AVAssetWriter(outputURL: outputURL, fileType: .m4a)
+        let input = AVAssetWriterInput(mediaType: .audio, outputSettings: [AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVSampleRateKey: 48_000, AVNumberOfChannelsKey: 2, AVEncoderBitRateKey: 128_000])
+        input.expectsMediaDataInRealTime = true
+        guard writer.canAdd(input) else { throw AppError.audioConversionFailed }
+        writer.add(input)
+        let stream = SCStream(filter: filter, configuration: configuration, delegate: nil)
+        let capture = DiscordAudioCapture(stream: stream, writer: writer, input: input)
+        try stream.addStreamOutput(capture, type: .audio, sampleHandlerQueue: capture.queue)
+        writer.startWriting()
+        try await stream.startCapture()
+        return capture
+    }
+
+    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of outputType: SCStreamOutputType) {
+        guard outputType == .audio, sampleBuffer.isValid else { return }
+        if !started { writer.startSession(atSourceTime: CMSampleBufferGetPresentationTimeStamp(sampleBuffer)); started = true }
+        if input.isReadyForMoreMediaData { _ = input.append(sampleBuffer) }
+    }
+
+    func stream(_ stream: SCStream, didStopWithError error: Error) { }
+
+    func stop() async {
+        try? await stream.stopCapture()
+        input.markAsFinished()
+        await withCheckedContinuation { continuation in writer.finishWriting { continuation.resume() } }
+    }
+}
+
 enum AppError: LocalizedError {
-    case recordingStart, audioConversionFailed, whisperFailed, emptyTranscript, ollamaUnavailable
+    case recordingStart, audioConversionFailed, whisperFailed, emptyTranscript, ollamaUnavailable, ffmpegMissing, noDisplay
     var errorDescription: String? {
         switch self {
         case .recordingStart: "Could not start recording. Check microphone access."
@@ -380,6 +495,8 @@ enum AppError: LocalizedError {
         case .whisperFailed: "Whisper could not transcribe this recording. Check the model and audio format."
         case .emptyTranscript: "Whisper finished without producing a transcript."
         case .ollamaUnavailable: "Could not reach the selected Ollama model. Check that Ollama is running and the model is installed."
+        case .ffmpegMissing: "ffmpeg is required to combine Discord call audio. Install it, then try again."
+        case .noDisplay: "No display is available for system audio capture."
         }
     }
 }
@@ -403,16 +520,17 @@ struct ContentView: View {
                         HStack(spacing: 10) {
                             Image(systemName: "waveform.circle.fill").font(.system(size: 28)).foregroundStyle(.blue)
                             VStack(alignment: .leading, spacing: 2) {
-                                Text("Lecture Recorder").font(.headline)
+                                Text("Audio Notes").font(.headline)
                                 Text("Your recordings, kept local").font(.caption).foregroundStyle(.secondary)
                             }
                         }
+                        Spacer(minLength: 0)
                     }
-                    Spacer(minLength: 0)
                     Button { sidebarVisible.toggle() } label: { Image(systemName: "sidebar.left") }
                         .accessibilityLabel(sidebarVisible ? "Collapse sidebar" : "Expand sidebar")
                         .help(sidebarVisible ? "Collapse sidebar" : "Expand sidebar")
                         .buttonStyle(.plain)
+                        .frame(maxWidth: sidebarVisible ? nil : .infinity, alignment: .center)
                 }.padding(.bottom, 8)
                 Button { tab = 0 } label: {
                     if sidebarVisible { Label("Lectures", systemImage: "waveform") }
@@ -433,7 +551,7 @@ struct ContentView: View {
 
             if tab == 0 { lecturesView } else { settingsView }
         }
-        .alert("Lecture Recorder", isPresented: Binding(get: { library.error != nil }, set: { if !$0 { library.error = nil } })) {
+        .alert("Audio Notes", isPresented: Binding(get: { library.error != nil }, set: { if !$0 { library.error = nil } })) {
             Button("OK", role: .cancel) { library.error = nil }
         } message: { Text(library.error ?? "") }
         .sheet(isPresented: $showingAddCourse) {
@@ -488,8 +606,11 @@ struct ContentView: View {
                         ForEach(library.courses, id: \.self) { Text($0).tag($0) }
                     }.frame(width: 180)
                     if !library.isRecording {
+                        Picker("Recording type", selection: $library.recordingMode) {
+                            ForEach(RecordingMode.allCases) { Text($0.rawValue).tag($0) }
+                        }.pickerStyle(.menu).frame(width: 190).fixedSize(horizontal: true, vertical: false)
                         TextField("Recording title", text: $library.title).textFieldStyle(.roundedBorder)
-                        Button { library.startRecording() } label: { Label("Record", systemImage: "record.circle") }
+                        Button { library.startRecording() } label: { Label(library.recordingMode == .discord ? "Record Call" : "Record", systemImage: "record.circle") }
                             .buttonStyle(.borderedProminent)
                     }
                 }
@@ -522,9 +643,11 @@ struct ContentView: View {
             if library.isRecording {
                 HStack {
                     Circle().fill(library.isPaused ? .orange : .red).frame(width: 9, height: 9)
-                    Text(library.isPaused ? "Recording paused" : "Recording lecture")
+                    Text(library.isPaused ? "Recording paused" : (library.recordingMode == .discord ? "Recording Discord call" : "Recording lecture"))
                     Spacer()
-                    Button(library.isPaused ? "Resume" : "Pause") { library.togglePause() }
+                    if library.recordingMode != .discord {
+                        Button(library.isPaused ? "Resume" : "Pause") { library.togglePause() }
+                    }
                     Button("Stop") { library.stopRecording() }.buttonStyle(.borderedProminent)
                 }.padding(14).background(.regularMaterial).clipShape(RoundedRectangle(cornerRadius: 12)).padding()
             }
@@ -533,7 +656,8 @@ struct ContentView: View {
 
     @ViewBuilder private var detailView: some View {
         if let lecture = library.selected {
-            VStack(alignment: .leading, spacing: 16) {
+            ScrollView {
+              VStack(alignment: .leading, spacing: 16) {
                 HStack {
                     VStack(alignment: .leading, spacing: 4) {
                         Text(lecture.title).font(.title3.bold()).lineLimit(2)
@@ -569,9 +693,9 @@ struct ContentView: View {
                     Spacer()
                     Button("Transcribe") { library.transcribe() }.disabled(library.isWorking || !lecture.hasTranscript && library.isRecording)
                 }
-                ScrollView { Text(library.transcriptText.isEmpty ? "Your transcript will appear here." : library.transcriptText)
-                    .frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled).font(.body).lineSpacing(4) }
-                    .frame(maxHeight: .infinity).layoutPriority(1).padding(14).background(Color(nsColor: .textBackgroundColor)).clipShape(RoundedRectangle(cornerRadius: 8))
+                Text(library.transcriptText.isEmpty ? "Your transcript will appear here." : library.transcriptText)
+                    .frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled).font(.body).lineSpacing(4)
+                    .padding(14).background(Color(nsColor: .textBackgroundColor)).clipShape(RoundedRectangle(cornerRadius: 8))
                 HStack {
                     Text("Notes").font(.headline)
                     Spacer()
@@ -583,11 +707,9 @@ struct ContentView: View {
                         .disabled(library.isWorking || !lecture.hasTranscript)
                 }
                 if !library.notesText.isEmpty {
-                    ScrollView {
-                        Text((try? AttributedString(markdown: library.notesText.readableMarkdown)) ?? AttributedString(library.notesText.readableMarkdown))
-                            .frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled).lineSpacing(4)
-                    }
-                        .frame(maxHeight: .infinity).layoutPriority(1).padding(14).background(Color(nsColor: .textBackgroundColor)).clipShape(RoundedRectangle(cornerRadius: 8))
+                    Text((try? AttributedString(markdown: library.notesText.readableMarkdown)) ?? AttributedString(library.notesText.readableMarkdown))
+                        .frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled).lineSpacing(4)
+                        .padding(14).background(Color(nsColor: .textBackgroundColor)).clipShape(RoundedRectangle(cornerRadius: 8))
                 } else {
                     Text("Generate notes from the transcript with your chosen Ollama model.").font(.caption).foregroundStyle(.secondary)
                 }
@@ -606,7 +728,8 @@ struct ContentView: View {
                         }
                     }.padding(10).background(Color(nsColor: .textBackgroundColor)).clipShape(RoundedRectangle(cornerRadius: 8))
                 }
-            }.padding(20)
+              }.padding(20)
+            }
         } else {
             ContentUnavailableView("Select a lecture", systemImage: "text.book.closed")
         }
@@ -620,6 +743,12 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 10) {
                 Text("Recordings folder").font(.headline)
                 HStack { Text(library.recordingsPath).font(.caption).foregroundStyle(.secondary).lineLimit(1); Spacer(); Button("Choose…") { library.chooseRecordingsFolder() } }
+            }
+            Divider()
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Discord call recording").font(.headline)
+                Text("Choose Discord call in Lectures to capture your microphone and Mac audio together. macOS will ask for Screen Recording and Microphone access. Install FFmpeg to combine the two audio sources when you stop.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             Divider()
             VStack(alignment: .leading, spacing: 10) {
