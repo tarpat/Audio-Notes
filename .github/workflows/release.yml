@@ -1,6 +1,8 @@
 name: Build macOS release
 
 on:
+  push:
+    branches: [main]
   release:
     types: [published]
 
@@ -33,7 +35,17 @@ jobs:
           cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
           ditto -c -k --sequesterRsrc --keepParent "$APP" .build/Audio-Notes-macOS.zip
 
+      - name: Upload build artifact
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Audio-Notes-macOS
+          path: .build/Audio-Notes-macOS.zip
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Attach app to GitHub Release
+        if: github.event_name == 'release'
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "$GITHUB_REF_NAME" .build/Audio-Notes-macOS.zip --clobber
