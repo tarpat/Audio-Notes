@@ -1,0 +1,39 @@
+name: Build macOS release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-upload:
+    runs-on: macos-14
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build Apple Silicon app
+        run: swift build -c release --triple arm64-apple-macosx14.0 --scratch-path .build/arm64
+
+      - name: Build Intel app
+        run: swift build -c release --triple x86_64-apple-macosx14.0 --scratch-path .build/x86_64
+
+      - name: Assemble and zip universal app
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARM_BIN="$(swift build -c release --triple arm64-apple-macosx14.0 --scratch-path .build/arm64 --show-bin-path)/LectureRecorder"
+          INTEL_BIN="$(swift build -c release --triple x86_64-apple-macosx14.0 --scratch-path .build/x86_64 --show-bin-path)/LectureRecorder"
+          APP=".build/Audio Notes.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          lipo -create "$ARM_BIN" "$INTEL_BIN" -output "$APP/Contents/MacOS/LectureRecorder"
+          cp Resources/Info.plist "$APP/Contents/Info.plist"
+          cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" .build/Audio-Notes-macOS.zip
+
+      - name: Attach app to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" .build/Audio-Notes-macOS.zip --clobber

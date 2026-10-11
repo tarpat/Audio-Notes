@@ -16,6 +16,10 @@ This builds the release binary, creates the app icon, and assembles `.build/Audi
 
 To build without opening the app, run `swift build -c release`. To create the icon separately, run `swift scripts/create-icon.swift Resources/AppIcon.icns`.
 
+## GitHub Releases
+
+Create and publish a release on GitHub (for example, with tag `v0.2.0`). The workflow in `.github/workflows/release.yml` builds a universal macOS app for Apple Silicon and Intel, then attaches `Audio-Notes-macOS.zip` to that release. The app is unsigned, so macOS may ask users to approve it when they first open it.
+
 ## Transcription setup
 
 Install `whisper.cpp` and `ffmpeg` so `whisper-cli` and `ffmpeg` are available on your Mac. Select a compatible Whisper GGML model in Settings. The app converts M4A audio to a temporary WAV locally before transcription; audio is not uploaded.
